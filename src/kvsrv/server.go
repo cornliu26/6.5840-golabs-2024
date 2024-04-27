@@ -28,6 +28,7 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
 	if value, ok := kv.kvmap[args.Key]; ok {
 		reply.Value = value
 	} else {
