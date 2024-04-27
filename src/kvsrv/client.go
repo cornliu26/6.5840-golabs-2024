@@ -61,12 +61,16 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	args := PutAppendArgs{key, value, ck.id, ck.seqNum}
 	reply := PutAppendReply{}
+	deleteReply := PutAppendReply{}
 
 	for !ck.server.Call("KVServer."+op, &args, &reply) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	ck.seqNum += 1
+	for !ck.server.Call("KVServer.DeleteBuffer", &args, &deleteReply) {
+		time.Sleep(100 * time.Millisecond)
+	}
 	return reply.Value
 }
 

@@ -73,6 +73,13 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("Append key: %s, value: %s, clerkId: %d, clerkSeq: %d", args.Key, args.Value, args.ClerkId, args.ClerkSeq)
 }
 
+func (kv *KVServer) DeleteBuffer(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	delete(kv.buffer, args.ClerkId)
+}
+
 func StartKVServer() *KVServer {
 	kv := &KVServer{
 		mu:     sync.Mutex{},
