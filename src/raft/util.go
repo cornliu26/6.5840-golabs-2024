@@ -50,3 +50,17 @@ func init() {
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
