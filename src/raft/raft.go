@@ -267,7 +267,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) applyCommittedEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	for rf.lastApplied < rf.commitIndex {
+	for rf.lastApplied < rf.commitIndex && rf.lastApplied+1 < len(rf.log) {
 		rf.lastApplied++
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -344,91 +344,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
 		rf.persist()
-
-		go rf.broadcastAppendEntries()
 	}
 
 	Debug(rf, "start command %v, index %v, term %v, isLeader %v", command, index, term, isLeader)
 
 	return index, term, isLeader
-}
-
-func (rf *Raft) broadcastAppendEntries() {
-	argsList := make([]*AppendEntriesArgs, len(rf.peers))
-
-	rf.mu.RLock()
-	currentTerm := rf.currentTerm
-	leaderId := rf.me
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		argsList[i] = &AppendEntriesArgs{
-			Term:     currentTerm,
-			LeaderId: leaderId,
-		}
-	}
-	rf.mu.RUnlock()
-
-	for i := range rf.peers {
-		if i == leaderId {
-			continue
-		}
-		go rf.sendAppendEntriesToPeer(i, argsList[i], currentTerm)
-	}
-
-	for i := range rf.peers {
-		if i == leaderId {
-			continue
-		}
-		go func(server int) {
-
-		}(i)
-	}
-}
-
-func (rf *Raft) sendAppendEntriesToPeer(server int, args *AppendEntriesArgs, currentTerm int) {
-	for {
-		reply := &AppendEntriesReply{}
-		if rf.killed() {
-			return
-		}
-
-		rf.mu.RLock()
-		if rf.state != leader || rf.currentTerm != currentTerm {
-			rf.mu.RUnlock()
-			return
-		}
-		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-		args.Entries = append([]LogEntry{}, rf.log[rf.nextIndex[server]:]...)
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.RUnlock()
-
-		if rf.sendAppendEntries(server, args, reply) {
-			rf.mu.Lock()
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.turnToFollower(reply.Term)
-				rf.mu.Unlock()
-				return
-			}
-
-			if reply.Success {
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-				Debug(rf, "append succ, nextIndex %v, matchIndex %v", rf.nextIndex[server], rf.matchIndex[server])
-				rf.updateCommitIndex()
-				rf.mu.Unlock()
-				return
-			} else {
-				rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
-			}
-			rf.mu.Unlock()
-		} else {
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
 }
 
 func (rf *Raft) updateCommitIndex() {
@@ -573,7 +493,7 @@ func (rf *Raft) heartbeat() {
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[i] - 1,
 				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-				Entries:      make([]LogEntry, 0),
+				Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[i]:]...),
 				LeaderCommit: rf.commitIndex,
 			}
 		}
@@ -584,17 +504,45 @@ func (rf *Raft) heartbeat() {
 				continue
 			}
 			rsp := &AppendEntriesReply{}
-			go func(index int) {
-				rf.sendAppendEntries(index, args[index], rsp)
-				rf.mu.Lock()
-				if rsp.Term > rf.currentTerm {
-					rf.turnToFollower(rsp.Term)
-				}
-				rf.mu.Unlock()
-			}(i)
+			go rf.sendWithRetry(i, args[i], rsp)
 		}
 
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) sendWithRetry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	for {
+		rf.mu.RLock()
+		if rf.state != leader || rf.currentTerm != args.Term {
+			rf.mu.RUnlock()
+			return
+		}
+		rf.mu.RUnlock()
+
+		if rf.sendAppendEntries(server, args, reply) {
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.turnToFollower(reply.Term)
+				rf.mu.Unlock()
+				return
+			}
+
+			if reply.Success {
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				Debug(rf, "append succ, nextIndex %v, matchIndex %v", rf.nextIndex[server], rf.matchIndex[server])
+				rf.updateCommitIndex()
+				rf.mu.Unlock()
+				return
+			} else {
+				rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+			}
+			rf.mu.Unlock()
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }
 
