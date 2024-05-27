@@ -245,16 +245,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term != rf.currentTerm {
-		if args.Term > rf.currentTerm {
-			rf.turnToFollower(args.Term)
-		}
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	if rf.state == candidate {
+	if args.Term > rf.currentTerm || rf.state == candidate {
 		rf.turnToFollower(args.Term)
 	}
 
