@@ -503,16 +503,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	return ok
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -608,7 +598,7 @@ func (rf *Raft) turnToLeader() {
 	rf.state = leader
 	rf.lastHeartbeat = time.Now()
 	rf.initLeaderState()
-	go rf.heartbeat()
+	go rf.heartbeat(rf.currentTerm)
 	Debug(rf, "========become leader========")
 }
 
@@ -617,6 +607,7 @@ func (rf *Raft) initLeaderState() {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		rf.matchIndex[i] = 0
 	}
+	rf.matchIndex[rf.me] = rf.getLastLogIndex()
 }
 
 func (rf *Raft) election() {
@@ -679,114 +670,136 @@ func (rf *Raft) election() {
 	}
 }
 
-func (rf *Raft) heartbeat() {
-	for !rf.killed() {
-		args := make([]*AppendEntriesArgs, len(rf.peers))
+func (rf *Raft) heartbeat(currentTerm int) {
+	var version int32
 
+	for {
 		rf.mu.RLock()
-		if rf.state != leader {
+
+		// Check leader state
+		if !rf.checkValidLeader(currentTerm) {
 			rf.mu.RUnlock()
 			return
 		}
+
+		atomic.AddInt32(&version, 1)
+		currentVersion := atomic.LoadInt32(&version)
+
+		// Send heartbeat
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
 			}
-			args[i] = &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
+
+			var args interface{}
+
+			// Send heartbeat with AppendEntries or InstallSnapshot
+			if rf.nextIndex[i] <= rf.snapshotIdx {
+				args = &InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.snapshotIdx,
+					LastIncludedTerm:  rf.snapshotTerm,
+					Data:              rf.persister.ReadSnapshot(),
+				}
+			} else {
+				args = &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.getTermByIndex(rf.nextIndex[i] - 1),
+					Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[i]-1-rf.snapshotIdx:]...),
+					LeaderCommit: rf.commitIndex,
+				}
 			}
+			go rf.sendWithRetry(i, args, currentVersion, &version)
 		}
 		rf.mu.RUnlock()
-
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go rf.sendWithRetry(i, args[i])
-		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (rf *Raft) sendWithRetry(server int, args *AppendEntriesArgs) {
-	for {
-		rf.mu.RLock()
-		if rf.state != leader || rf.currentTerm != args.Term {
-			rf.mu.RUnlock()
+func (rf *Raft) checkValidLeader(term int) bool {
+	return !rf.killed() && rf.state == leader && rf.currentTerm == term
+}
+
+func (rf *Raft) sendWithRetry(server int, args interface{}, currentVersion int32, version *int32) {
+	for i := 0; i < 3; i++ {
+		if atomic.LoadInt32(version) != currentVersion {
 			return
 		}
-		if rf.nextIndex[server] <= rf.snapshotIdx {
-			rf.mu.RUnlock()
-			rf.sendSnapshot(server)
-			continue
+		var success bool
+		switch args := args.(type) {
+		case *AppendEntriesArgs:
+			success = rf.sendAppendEntries(server, args)
+		case *InstallSnapshotArgs:
+			success = rf.sendInstallSnapshot(server, args)
 		}
-		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.getTermByIndex(args.PrevLogIndex)
-		args.Entries = append([]LogEntry{}, rf.log[args.PrevLogIndex-rf.snapshotIdx:]...)
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.RUnlock()
-
-		reply := &AppendEntriesReply{}
-		if rf.sendAppendEntries(server, args, reply) {
-			rf.mu.Lock()
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.turnToFollower(reply.Term)
-				rf.mu.Unlock()
-				return
-			}
-
-			if reply.Success {
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-				Debug(rf, "append succ, server%v nextIdx%v matchIdx%v", server, rf.nextIndex[server], rf.matchIndex[server])
-				rf.updateCommitIndex()
-				rf.mu.Unlock()
-				return
-			} else {
-				Debug(rf, "append fail, server%v XTerm%v XIdx%v XLen%v", server, reply.Term, reply.XIndex, reply.XLen)
-				if reply.XTerm == -1 {
-					// Follower's log is shorter than PrevLogIndex
-					rf.nextIndex[server] = reply.XLen
-				} else {
-					// Follower has conflicting entry
-					rf.nextIndex[server] = rf.getFirstLogIndex(reply.XIndex)
-				}
-			}
-			rf.mu.Unlock()
-		} else {
-			time.Sleep(10 * time.Millisecond)
+		if success {
+			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func (rf *Raft) sendSnapshot(server int) {
-	rf.mu.RLock()
-	args := InstallSnapshotArgs{
-		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
-		LastIncludedIndex: rf.snapshotIdx,
-		LastIncludedTerm:  rf.snapshotTerm,
-		Data:              rf.persister.ReadSnapshot(),
-	}
-	rf.mu.RUnlock()
-
-	Debug(rf, "send install snapshot len %v", len(args.Data))
-
-	reply := InstallSnapshotReply{}
-	if rf.sendInstallSnapshot(server, &args, &reply) {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) bool {
+	reply := &AppendEntriesReply{}
+	if rf.peers[server].Call("Raft.AppendEntries", args, reply) {
 		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
 		if reply.Term > rf.currentTerm {
 			rf.turnToFollower(reply.Term)
-			rf.mu.Unlock()
-			return
+			return true
 		}
+
+		if !rf.checkValidLeader(args.Term) {
+			return true
+		}
+
+		if reply.Success {
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			Debug(rf, "append succ, server%v nextIdx%v matchIdx%v", server, rf.nextIndex[server], rf.matchIndex[server])
+			rf.updateCommitIndex()
+		} else {
+			Debug(rf, "append fail, server%v XTerm%v XIdx%v XLen%v", server, reply.Term, reply.XIndex, reply.XLen)
+			if reply.XTerm == -1 {
+				// Follower's log is shorter than PrevLogIndex
+				rf.nextIndex[server] = reply.XLen
+			} else {
+				// Follower has conflicting entry
+				rf.nextIndex[server] = rf.getFirstLogIndex(reply.XIndex)
+			}
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs) bool {
+	reply := &InstallSnapshotReply{}
+	if rf.peers[server].Call("Raft.InstallSnapshot", args, reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if reply.Term > rf.currentTerm {
+			rf.turnToFollower(reply.Term)
+			return true
+		}
+
+		if !rf.checkValidLeader(args.Term) {
+			return true
+		}
+
 		rf.nextIndex[server] = args.LastIncludedIndex + 1
 		rf.matchIndex[server] = args.LastIncludedIndex
-		rf.mu.Unlock()
+		return true
 	}
+	return false
 }
 
 func (rf *Raft) ticker() {
